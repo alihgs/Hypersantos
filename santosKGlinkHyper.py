@@ -1,7 +1,7 @@
 import itertools
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -26,15 +26,15 @@ def unique_non_empty(series: pd.Series) -> List[str]:
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
     if denom == 0:
         return 0.0
     return float(np.dot(a, b) / denom)
 
 
-def mean_pool(vectors: np.ndarray) -> np.ndarray:
+def mean_pool(vectors: np.ndarray, fallback_dim: int = 384) -> np.ndarray:
     if len(vectors) == 0:
-        return np.zeros((384,), dtype=np.float32)
+        return np.zeros((fallback_dim,), dtype=np.float32)
     return np.mean(vectors, axis=0)
 
 
@@ -60,19 +60,11 @@ def is_date_like(text: str) -> bool:
     return any(re.fullmatch(p, text) for p in patterns)
 
 
-def jaccard_tokens(a: str, b: str) -> float:
-    ta = set(norm_text(a).split())
-    tb = set(norm_text(b).split())
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / len(ta | tb)
-
-
 # ============================================================
 # Embedding model
 # ============================================================
 
-class BertEncoder:
+class TextEncoder:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         self.model = SentenceTransformer(model_name)
         self.cache: Dict[str, np.ndarray] = {}
@@ -94,7 +86,7 @@ class BertEncoder:
 
 
 # ============================================================
-# Lightweight KG structures (KGLink-inspired)
+# KG backend abstraction
 # ============================================================
 
 @dataclass
@@ -103,85 +95,88 @@ class KGEntity:
     label: str
     types: List[str]
     neighbors: List[str] = field(default_factory=list)
+    predicates: List[str] = field(default_factory=list)
 
 
-class SimpleKnowledgeGraph:
+class KGBackend:
+    """
+    Interface abstraite pour brancher plus tard :
+    - un BM25 réel sur Wikidata
+    - un index Elasticsearch
+    - un service d'entity linking
+    """
+    def link_cell_mentions(self, mentions: List[str], top_k: int = 5) -> Dict[str, List[Tuple[KGEntity, float]]]:
+        raise NotImplementedError
+
+    def get_one_hop_neighbors(self, entity: KGEntity) -> List[str]:
+        raise NotImplementedError
+
+
+class DemoKGBackend(KGBackend):
+    """
+    Backend simplifié pour test local.
+    Remplaçable plus tard par vrai BM25 + Wikidata.
+    """
     def __init__(self):
         self.entities: Dict[str, KGEntity] = {}
-        self.label_to_ids: Dict[str, List[str]] = {}
+        self._build_demo_kg()
 
-    def add_entity(self, entity: KGEntity) -> None:
-        self.entities[entity.entity_id] = entity
-        key = norm_text(entity.label)
-        self.label_to_ids.setdefault(key, []).append(entity.entity_id)
+    def _add(self, e: KGEntity) -> None:
+        self.entities[e.entity_id] = e
 
-    def get_entity(self, entity_id: str) -> KGEntity:
-        return self.entities[entity_id]
+    def _build_demo_kg(self) -> None:
+        demo_entities = [
+            KGEntity("E1", "Chicago", ["city", "location"], ["illinois", "usa"], ["located_in"]),
+            KGEntity("E2", "Fresno", ["city", "location"], ["california", "usa"], ["located_in"]),
+            KGEntity("E3", "Riverside", ["city", "location"], ["california", "usa"], ["located_in"]),
+            KGEntity("E4", "USA", ["country", "location"], ["north america"], ["part_of"]),
+            KGEntity("E5", "Qatar", ["country", "location"], ["asia"], ["part_of"]),
+            KGEntity("E6", "Messi", ["person", "athlete", "football player"], ["psg", "argentina"], ["plays_for"]),
+            KGEntity("E7", "Akram Afif", ["person", "athlete", "football player"], ["psg", "qatar"], ["plays_for"]),
+            KGEntity("E8", "PSG", ["team", "sports team"], ["football", "france"], ["has_player"]),
+            KGEntity("E9", "Coco", ["film"], ["animation", "disney"], ["directed_by"]),
+            KGEntity("E10", "Moana", ["film"], ["animation", "disney"], ["directed_by"]),
+            KGEntity("E11", "Film Director", ["occupation"], ["film"], []),
+            KGEntity("E12", "Singer", ["occupation"], ["music"], []),
+            KGEntity("E13", "Doha", ["city", "location"], ["qatar"], ["located_in"]),
+            KGEntity("E14", "Boston", ["city", "location"], ["usa"], ["located_in"]),
+        ]
+        for e in demo_entities:
+            self._add(e)
 
-    def find_candidates(self, mention: str, top_k: int = 5) -> List[Tuple[KGEntity, float]]:
-        mention_n = norm_text(mention)
-        if not mention_n:
-            return []
+    def _score(self, mention: str, label: str) -> float:
+        m = norm_text(mention)
+        l = norm_text(label)
+        if not m or not l:
+            return 0.0
+        if m == l:
+            return 1.0
+        if m in l or l in m:
+            return 0.85
+        mt = set(m.split())
+        lt = set(l.split())
+        if not mt or not lt:
+            return 0.0
+        return len(mt & lt) / len(mt | lt)
 
-        scored: List[Tuple[KGEntity, float]] = []
+    def link_cell_mentions(self, mentions: List[str], top_k: int = 5) -> Dict[str, List[Tuple[KGEntity, float]]]:
+        out: Dict[str, List[Tuple[KGEntity, float]]] = {}
+        for mention in mentions:
+            scored = []
+            for ent in self.entities.values():
+                s = self._score(mention, ent.label)
+                if s > 0:
+                    scored.append((ent, s))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            out[mention] = scored[:top_k]
+        return out
 
-        for ent in self.entities.values():
-            lbl = norm_text(ent.label)
-
-            score = 0.0
-            if mention_n == lbl:
-                score = 1.0
-            elif mention_n in lbl or lbl in mention_n:
-                score = 0.85
-            else:
-                score = jaccard_tokens(mention_n, lbl)
-
-            if score > 0:
-                scored.append((ent, score))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:top_k]
-
-
-def build_demo_kg() -> SimpleKnowledgeGraph:
-    kg = SimpleKnowledgeGraph()
-
-    entities = [
-        KGEntity("E1", "Chicago", ["city", "location"], ["illinois", "usa"]),
-        KGEntity("E2", "Fresno", ["city", "location"], ["california", "usa"]),
-        KGEntity("E3", "Riverside", ["city", "location"], ["california", "usa"]),
-        KGEntity("E4", "USA", ["country", "location"], ["north america"]),
-        KGEntity("E5", "Qatar", ["country", "location"], ["asia"]),
-        KGEntity("E6", "James Taylor", ["person", "artist", "singer"], ["usa", "music"]),
-        KGEntity("E7", "Akram Afif", ["person", "athlete", "football player"], ["qatar", "football"]),
-        KGEntity("E8", "Anthony Pelissier", ["person", "film director"], ["film"]),
-        KGEntity("E9", "Moana", ["film"], ["animation", "disney"]),
-        KGEntity("E10", "Coco", ["film"], ["animation", "disney"]),
-        KGEntity("E11", "Bee Movie", ["film"], ["animation"]),
-        KGEntity("E12", "Tom Lee", ["person"], []),
-        KGEntity("E13", "Anna Reed", ["person"], []),
-        KGEntity("E14", "Paul Veliotis", ["person"], []),
-        KGEntity("E15", "Vera Onate", ["person"], []),
-        KGEntity("E16", "Boston", ["city", "location"], ["usa"]),
-        KGEntity("E17", "Doha", ["city", "location"], ["qatar"]),
-        KGEntity("E18", "Barnet", ["city", "location"], ["uk"]),
-        KGEntity("E19", "UK", ["country", "location"], ["europe"]),
-        KGEntity("E20", "Singer", ["occupation"], ["music"]),
-        KGEntity("E21", "Film Director", ["occupation"], ["film"]),
-        KGEntity("E22", "Football Player", ["occupation"], ["sport"]),
-        KGEntity("E23", "PSG", ["team", "sports team"], ["football", "france"]),
-        KGEntity("E24", "Messi", ["person", "athlete", "football player"], ["psg", "argentina"]),
-        KGEntity("E25", "2022", ["year", "time"], []),
-    ]
-
-    for e in entities:
-        kg.add_entity(e)
-
-    return kg
+    def get_one_hop_neighbors(self, entity: KGEntity) -> List[str]:
+        return entity.neighbors
 
 
 # ============================================================
-# Semantic objects
+# KGLink-like output structures
 # ============================================================
 
 @dataclass
@@ -190,6 +185,7 @@ class ColumnInfo:
     header_emb: np.ndarray
     values_emb: np.ndarray
     type_emb: np.ndarray
+    feature_emb: np.ndarray
     column_emb: np.ndarray
     candidate_types: List[Tuple[str, float]]
     linked_entities: List[Tuple[str, str, float]]
@@ -213,6 +209,208 @@ class HyperRelation:
     uniqueness: float
     coverage: float
 
+
+# ============================================================
+# KGLink encoder
+# ============================================================
+
+class KGLinkEncoder:
+    """
+    Version intégrable dans SANTOS/Hypergraph.
+
+    Cette classe suit la logique du papier :
+    - linking des cellules vers un KG
+    - types candidats
+    - feature vector à partir du KG
+    - représentation de colonne
+
+    Mais sans la partie training multi-task du papier.
+    """
+    def __init__(
+        self,
+        text_encoder: TextEncoder,
+        kg_backend: KGBackend,
+        top_k_entities: int = 3,
+        top_k_types: int = 5,
+    ):
+        self.text_encoder = text_encoder
+        self.kg_backend = kg_backend
+        self.top_k_entities = top_k_entities
+        self.top_k_types = top_k_types
+
+    def _infer_numeric_types(self, series: pd.Series) -> List[Tuple[str, float]]:
+        vals = pd.to_numeric(series, errors="coerce").dropna()
+        if len(vals) == 0:
+            return []
+
+        out = [("numeric", 1.0)]
+        mn = float(vals.mean())
+        std = float(vals.std()) if len(vals) > 1 else 0.0
+
+        if np.allclose(vals, vals.astype(int), atol=1e-6):
+            out.append(("integer", 0.9))
+        else:
+            out.append(("real number", 0.8))
+
+        if 1800 <= mn <= 2100 and std < 100:
+            out.append(("year", 0.85))
+        if 0 <= mn <= 150 and std < 50:
+            out.append(("measurement", 0.55))
+
+        return out
+
+    def _build_feature_sequence(self, best_entities: List[KGEntity]) -> List[str]:
+        """
+        Approximation de la feature sequence du papier :
+        entité + voisins 1-hop + éventuellement prédicats.
+        """
+        seq = []
+        for ent in best_entities[:3]:
+            seq.append(ent.label)
+            seq.extend(ent.predicates[:3])
+            seq.extend(self.kg_backend.get_one_hop_neighbors(ent)[:5])
+        return [norm_text(x) for x in seq if norm_text(x)]
+
+    def _extract_candidate_types(
+        self,
+        linked_entities: List[Tuple[KGEntity, float]]
+    ) -> List[Tuple[str, float]]:
+        type_scores: Dict[str, float] = {}
+
+        for ent, score in linked_entities:
+            for t in ent.types:
+                type_scores[t] = type_scores.get(t, 0.0) + score
+
+            # context léger via 1-hop neighbors
+            for nb in ent.neighbors:
+                nb = norm_text(nb)
+                if nb and nb not in {"person", "date"}:
+                    type_scores[nb] = type_scores.get(nb, 0.0) + 0.2 * score
+
+        ranked = sorted(type_scores.items(), key=lambda x: x[1], reverse=True)
+        return ranked[: self.top_k_types]
+
+    def _embed_weighted_labels(
+        self,
+        labels: List[Tuple[str, float]],
+        fallback_dim_from: np.ndarray
+    ) -> np.ndarray:
+        if not labels:
+            return np.zeros_like(fallback_dim_from)
+
+        texts = [t for t, _ in labels]
+        weights = np.array([w for _, w in labels], dtype=np.float32)
+        weights = weights / (weights.sum() + 1e-8)
+
+        embs = self.text_encoder.encode_many(texts)
+        out = np.average(embs, axis=0, weights=weights)
+
+        denom = np.linalg.norm(out)
+        if denom > 0:
+            out = out / denom
+        return out
+
+    def encode_column(self, df: pd.DataFrame, col: str) -> ColumnInfo:
+        header_emb = self.text_encoder.encode_text(col)
+        values = unique_non_empty(df[col])
+
+        if values:
+            values_emb = mean_pool(self.text_encoder.encode_many(values))
+        else:
+            values_emb = np.zeros_like(header_emb)
+
+        text_emb = 0.4 * header_emb + 0.6 * values_emb
+        denom = np.linalg.norm(text_emb)
+        if denom > 0:
+            text_emb = text_emb / denom
+
+        numeric_ratio = pd.to_numeric(df[col], errors="coerce").notna().mean()
+
+        # Cas numérique
+        if numeric_ratio >= 0.8:
+            candidate_types = self._infer_numeric_types(df[col])
+            type_emb = self._embed_weighted_labels(candidate_types, header_emb)
+            feature_emb = type_emb.copy()
+
+            column_emb = 0.55 * type_emb + 0.45 * text_emb
+            denom = np.linalg.norm(column_emb)
+            if denom > 0:
+                column_emb = column_emb / denom
+
+            return ColumnInfo(
+                name=col,
+                header_emb=header_emb,
+                values_emb=values_emb,
+                type_emb=type_emb,
+                feature_emb=feature_emb,
+                column_emb=column_emb,
+                candidate_types=candidate_types,
+                linked_entities=[],
+                coverage=0.0,
+            )
+
+        # Entity linking
+        non_special_values = [
+            v for v in values[:50]
+            if not is_numeric_like(v) and not is_date_like(v)
+        ]
+
+        link_results = self.kg_backend.link_cell_mentions(non_special_values, top_k=self.top_k_entities)
+
+        best_entities: List[KGEntity] = []
+        linked_entities: List[Tuple[KGEntity, float]] = []
+        debug_links: List[Tuple[str, str, float]] = []
+
+        matched_cells = 0
+        for cell in non_special_values:
+            candidates = link_results.get(cell, [])
+            if not candidates:
+                continue
+            ent, score = candidates[0]
+            best_entities.append(ent)
+            linked_entities.append((ent, score))
+            debug_links.append((cell, ent.label, float(score)))
+            matched_cells += 1
+
+        coverage = matched_cells / max(1, len(non_special_values))
+
+        candidate_types = self._extract_candidate_types(linked_entities)
+        type_emb = self._embed_weighted_labels(candidate_types, header_emb)
+
+        # Feature vector KG
+        feature_tokens = self._build_feature_sequence(best_entities)
+        if feature_tokens:
+            feature_emb = mean_pool(self.text_encoder.encode_many(feature_tokens))
+            denom = np.linalg.norm(feature_emb)
+            if denom > 0:
+                feature_emb = feature_emb / denom
+        else:
+            feature_emb = np.zeros_like(header_emb)
+
+        if np.linalg.norm(type_emb) == 0 and np.linalg.norm(feature_emb) == 0:
+            column_emb = text_emb
+        else:
+            column_emb = 0.45 * type_emb + 0.25 * feature_emb + 0.30 * text_emb
+            denom = np.linalg.norm(column_emb)
+            if denom > 0:
+                column_emb = column_emb / denom
+
+        return ColumnInfo(
+            name=col,
+            header_emb=header_emb,
+            values_emb=values_emb,
+            type_emb=type_emb,
+            feature_emb=feature_emb,
+            column_emb=column_emb,
+            candidate_types=candidate_types,
+            linked_entities=debug_links,
+            coverage=coverage,
+        )
+
+
+# ============================================================
+# Semantic graph + hypergraph
+# ============================================================
 
 class SemanticGraph:
     def __init__(self, table_name: str):
@@ -241,168 +439,16 @@ class SemanticGraph:
     def column_info(self, c: str) -> ColumnInfo:
         return self.graph.nodes[c]["info"]
 
-    def get_hyperedges_by_arity(self, arity: int) -> List[HyperRelation]:
-        return [h for h in self.hyperedges if len(h.columns) == arity]
-
 
 # ============================================================
-# KGLink-inspired column semantics
+# Column matching
 # ============================================================
-
-def infer_numeric_candidate_types(series: pd.Series) -> List[Tuple[str, float]]:
-    vals = pd.to_numeric(series, errors="coerce").dropna()
-    if len(vals) == 0:
-        return []
-
-    out = [("numeric", 1.0)]
-
-    mn = float(vals.mean())
-    std = float(vals.std()) if len(vals) > 1 else 0.0
-
-    if np.allclose(vals, vals.astype(int), atol=1e-6):
-        out.append(("integer", 0.9))
-    else:
-        out.append(("real number", 0.8))
-
-    if mn >= 1800 and mn <= 2100 and std < 100:
-        out.append(("year", 0.85))
-    if mn >= 0 and mn <= 150 and std < 50:
-        out.append(("measurement", 0.55))
-
-    return out
-
-
-def extract_candidate_types_from_entities(
-    linked_entities: List[Tuple[KGEntity, float]],
-    kg: SimpleKnowledgeGraph,
-) -> List[Tuple[str, float]]:
-    type_scores: Dict[str, float] = {}
-
-    for ent, link_score in linked_entities:
-        for t in ent.types:
-            type_scores[t] = type_scores.get(t, 0.0) + 1.0 * link_score
-
-        for nb in ent.neighbors:
-            nb_n = norm_text(nb)
-            if nb_n not in {"person", "date"}:
-                type_scores[nb_n] = type_scores.get(nb_n, 0.0) + 0.25 * link_score
-
-    ranked = sorted(type_scores.items(), key=lambda x: x[1], reverse=True)
-    return ranked[:5]
-
-
-def embed_candidate_types(
-    candidate_types: List[Tuple[str, float]],
-    encoder: BertEncoder,
-    dim_fallback_from: np.ndarray,
-) -> np.ndarray:
-    if not candidate_types:
-        return np.zeros_like(dim_fallback_from)
-
-    texts = [t for t, _ in candidate_types]
-    weights = np.array([w for _, w in candidate_types], dtype=np.float32)
-    weights = weights / (weights.sum() + 1e-8)
-
-    embs = encoder.encode_many(texts)
-    type_emb = np.average(embs, axis=0, weights=weights)
-
-    denom = np.linalg.norm(type_emb)
-    if denom > 0:
-        type_emb = type_emb / denom
-    return type_emb
-
-
-def build_column_info(
-    df: pd.DataFrame,
-    col: str,
-    encoder: BertEncoder,
-    kg: SimpleKnowledgeGraph,
-    kg_weight: float = 0.65,
-    text_weight: float = 0.35,
-) -> ColumnInfo:
-    header_emb = encoder.encode_text(col)
-
-    values = unique_non_empty(df[col])
-    if values:
-        value_embs = encoder.encode_many(values)
-        values_emb = mean_pool(value_embs)
-    else:
-        values_emb = np.zeros_like(header_emb)
-
-    text_emb = 0.4 * header_emb + 0.6 * values_emb
-    denom = np.linalg.norm(text_emb)
-    if denom > 0:
-        text_emb = text_emb / denom
-
-    linked_entities: List[Tuple[KGEntity, float]] = []
-    linked_entities_debug: List[Tuple[str, str, float]] = []
-
-    numeric_ratio = pd.to_numeric(df[col], errors="coerce").notna().mean()
-
-    if numeric_ratio >= 0.8:
-        candidate_types = infer_numeric_candidate_types(df[col])
-        type_emb = embed_candidate_types(candidate_types, encoder, header_emb)
-
-        column_emb = kg_weight * type_emb + text_weight * text_emb
-        denom = np.linalg.norm(column_emb)
-        if denom > 0:
-            column_emb = column_emb / denom
-
-        return ColumnInfo(
-            name=col,
-            header_emb=header_emb,
-            values_emb=values_emb,
-            type_emb=type_emb,
-            column_emb=column_emb,
-            candidate_types=candidate_types,
-            linked_entities=[],
-            coverage=0.0,
-        )
-
-    matched_cells = 0
-    for cell in values[:50]:
-        if is_numeric_like(cell) or is_date_like(cell):
-            continue
-
-        candidates = kg.find_candidates(cell, top_k=3)
-        if not candidates:
-            continue
-
-        best_ent, best_score = candidates[0]
-        linked_entities.append((best_ent, best_score))
-        linked_entities_debug.append((cell, best_ent.label, float(best_score)))
-        matched_cells += 1
-
-    coverage = matched_cells / max(1, len(values[:50]))
-
-    candidate_types = extract_candidate_types_from_entities(linked_entities, kg)
-    type_emb = embed_candidate_types(candidate_types, encoder, header_emb)
-
-    if len(candidate_types) == 0 or np.linalg.norm(type_emb) == 0:
-        column_emb = text_emb
-        type_emb = np.zeros_like(text_emb)
-    else:
-        column_emb = kg_weight * type_emb + text_weight * text_emb
-        denom = np.linalg.norm(column_emb)
-        if denom > 0:
-            column_emb = column_emb / denom
-
-    return ColumnInfo(
-        name=col,
-        header_emb=header_emb,
-        values_emb=values_emb,
-        type_emb=type_emb,
-        column_emb=column_emb,
-        candidate_types=candidate_types,
-        linked_entities=linked_entities_debug,
-        coverage=coverage,
-    )
-
 
 def column_match(q_col: ColumnInfo, t_col: ColumnInfo) -> float:
     s_header = cosine(q_col.header_emb, t_col.header_emb)
     s_values = cosine(q_col.values_emb, t_col.values_emb)
     s_type = cosine(q_col.type_emb, t_col.type_emb)
+    s_feature = cosine(q_col.feature_emb, t_col.feature_emb)
     s_column = cosine(q_col.column_emb, t_col.column_emb)
 
     q_types = {t for t, _ in q_col.candidate_types}
@@ -412,20 +458,20 @@ def column_match(q_col: ColumnInfo, t_col: ColumnInfo) -> float:
         overlap_bonus = len(q_types & t_types) / len(q_types | t_types)
 
     score = (
-        0.10 * s_header +
-        0.15 * s_values +
-        0.45 * s_type +
+        0.08 * s_header +
+        0.10 * s_values +
+        0.32 * s_type +
+        0.20 * s_feature +
         0.25 * s_column +
         0.05 * overlap_bonus
     )
 
     score *= (0.9 + 0.1 * min(1.0, q_col.coverage + t_col.coverage))
-
     return max(0.0, min(1.0, score))
 
 
 # ============================================================
-# Binary relationship semantics
+# Binary relation layer
 # ============================================================
 
 def infer_relation_label(
@@ -447,8 +493,6 @@ def infer_relation_label(
     name1 = norm_text(c1)
     name2 = norm_text(c2)
 
-    if "city" in name2 and ("country" in name1 or "state" in name1):
-        return "located_in_reverse", 0.7
     if "country" in name2 and "city" in name1:
         return "located_in", 0.8
     if "director" in name2 and "film" in name1:
@@ -468,7 +512,7 @@ def build_relation_info(
     df: pd.DataFrame,
     c1: str,
     c2: str,
-    encoder: BertEncoder,
+    encoder: TextEncoder,
 ) -> RelationInfo:
     label, score = infer_relation_label(df, c1, c2)
     emb = encoder.encode_text(label)
@@ -491,55 +535,38 @@ def infer_hyper_relation_label(
     coverage_threshold: float = 0.5,
     uniqueness_threshold: float = 0.6,
 ) -> Optional[Tuple[str, float, int, float, float]]:
-    """
-    Détection heuristique d'une hyperrelation.
-
-    Intuition :
-    - les colonnes forment un motif n-aire si leur combinaison a une structure répétée
-    - ou si elles représentent un événement / une association composite stable
-
-    Mesures :
-    - support : nombre de lignes valides
-    - uniqueness : nb combinaisons uniques / nb lignes
-    - coverage : proportion de lignes non nulles sur ces colonnes
-    """
     subset = df[list(cols)].dropna()
     if len(subset) < support_threshold:
         return None
 
     support = len(subset)
-    unique_rows = len(subset.drop_duplicates())
-    uniqueness = unique_rows / max(1, support)
+    uniqueness = len(subset.drop_duplicates()) / max(1, support)
     coverage = support / max(1, len(df))
 
     if coverage < coverage_threshold:
+        return None
+    if uniqueness < uniqueness_threshold:
         return None
 
     colnames = [norm_text(c) for c in cols]
     joined = "_".join(colnames)
 
-    # Cas intéressant :
-    # si la combinaison est assez unique, elle décrit souvent une relation composite
-    # ex: (player, team, year), (film, director, year), (city, country, population)
-    if uniqueness >= uniqueness_threshold:
-        if any("year" in c or "date" in c for c in colnames):
-            return f"temporal_hyper_relation_{joined}", 0.85, support, uniqueness, coverage
-        if any("country" in c or "city" in c or "state" in c for c in colnames):
-            return f"location_hyper_relation_{joined}", 0.80, support, uniqueness, coverage
-        if any("director" in c or "film" in c for c in colnames):
-            return f"film_hyper_relation_{joined}", 0.88, support, uniqueness, coverage
-        if any("team" in c or "player" in c for c in colnames):
-            return f"sport_hyper_relation_{joined}", 0.88, support, uniqueness, coverage
+    if any("year" in c or "date" in c for c in colnames):
+        return f"temporal_hyper_relation_{joined}", 0.85, support, uniqueness, coverage
+    if any("team" in c or "player" in c or "club" in c for c in colnames):
+        return f"sport_hyper_relation_{joined}", 0.88, support, uniqueness, coverage
+    if any("film" in c or "director" in c for c in colnames):
+        return f"film_hyper_relation_{joined}", 0.88, support, uniqueness, coverage
+    if any("city" in c or "country" in c or "population" in c for c in colnames):
+        return f"location_hyper_relation_{joined}", 0.80, support, uniqueness, coverage
 
-        return f"composite_hyper_relation_{joined}", 0.75, support, uniqueness, coverage
-
-    return None
+    return f"composite_hyper_relation_{joined}", 0.75, support, uniqueness, coverage
 
 
 def build_hyper_relation_info(
     df: pd.DataFrame,
     cols: Tuple[str, ...],
-    encoder: BertEncoder,
+    encoder: TextEncoder,
 ) -> Optional[HyperRelation]:
     res = infer_hyper_relation_label(df, cols)
     if res is None:
@@ -575,51 +602,44 @@ def hyper_column_set_match(
     q_cols: Tuple[str, ...],
     t_cols: Tuple[str, ...],
 ) -> float:
-    """
-    Score de matching entre deux ensembles ordonnés de colonnes.
-    On compare les colonnes position par position.
-    """
     if len(q_cols) != len(t_cols):
         return 0.0
 
     scores = []
     for qc, tc in zip(q_cols, t_cols):
-        q_info = q_graph.column_info(qc)
-        t_info = t_graph.column_info(tc)
-        scores.append(column_match(q_info, t_info))
+        scores.append(column_match(q_graph.column_info(qc), t_graph.column_info(tc)))
 
     if not scores:
         return 0.0
-
     return float(np.mean(scores))
 
 
 # ============================================================
-# Build semantic graph + hypergraph
+# Build graph
 # ============================================================
 
 def build_semantic_graph(
     df: pd.DataFrame,
     table_name: str,
-    encoder: BertEncoder,
-    kg: SimpleKnowledgeGraph,
+    text_encoder: TextEncoder,
+    kglink_encoder: KGLinkEncoder,
     max_hyperedge_size: int = 3,
 ) -> SemanticGraph:
     sg = SemanticGraph(table_name)
 
     for col in df.columns:
-        info = build_column_info(df, col, encoder, kg)
+        info = kglink_encoder.encode_column(df, col)
         sg.add_column(col, info)
 
     for c1, c2 in itertools.combinations(df.columns, 2):
-        rel = build_relation_info(df, c1, c2, encoder)
+        rel = build_relation_info(df, c1, c2, text_encoder)
         if rel.score > 0:
             sg.add_relation(c1, c2, rel)
 
     cols = list(df.columns)
     for size in range(3, min(max_hyperedge_size, len(cols)) + 1):
         for combo in itertools.combinations(cols, size):
-            hrel = build_hyper_relation_info(df, combo, encoder)
+            hrel = build_hyper_relation_info(df, combo, text_encoder)
             if hrel is not None:
                 sg.add_hyper_relation(hrel)
 
@@ -627,7 +647,7 @@ def build_semantic_graph(
 
 
 # ============================================================
-# SANTOS pair score and hyper score
+# Matching
 # ============================================================
 
 def pair_match(
@@ -688,18 +708,15 @@ def best_alignment_score(
     q_cols = q_graph.columns()
     t_cols = t_graph.columns()
 
-    # Binary SANTOS score
     for qc1, qc2 in itertools.combinations(q_cols, 2):
         best = 0.0
         for tc1, tc2 in itertools.combinations(t_cols, 2):
             s1 = pair_match(q_graph, t_graph, qc1, qc2, tc1, tc2)
             s2 = pair_match(q_graph, t_graph, qc1, qc2, tc2, tc1)
             best = max(best, s1, s2)
-
         if best >= binary_threshold:
             total_binary += best
 
-    # Hypergraph score
     q_by_arity: Dict[int, List[HyperRelation]] = {}
     t_by_arity: Dict[int, List[HyperRelation]] = {}
 
@@ -716,9 +733,7 @@ def best_alignment_score(
         for q_h in q_hrels:
             best = 0.0
             for t_h in t_hrels:
-                s = hyper_match(q_graph, t_graph, q_h, t_h)
-                best = max(best, s)
-
+                best = max(best, hyper_match(q_graph, t_graph, q_h, t_h))
             if best >= hyper_threshold:
                 total_hyper += best
 
@@ -733,11 +748,12 @@ class SantosHyperKGLink:
     def __init__(
         self,
         model_name: str = "all-MiniLM-L6-v2",
-        kg: Optional[SimpleKnowledgeGraph] = None,
+        kg_backend: Optional[KGBackend] = None,
         max_hyperedge_size: int = 3,
     ):
-        self.encoder = BertEncoder(model_name=model_name)
-        self.kg = kg if kg is not None else build_demo_kg()
+        self.text_encoder = TextEncoder(model_name=model_name)
+        self.kg_backend = kg_backend if kg_backend is not None else DemoKGBackend()
+        self.kglink_encoder = KGLinkEncoder(self.text_encoder, self.kg_backend)
         self.max_hyperedge_size = max_hyperedge_size
 
         self.tables: Dict[str, pd.DataFrame] = {}
@@ -746,19 +762,19 @@ class SantosHyperKGLink:
     def add_table(self, name: str, df: pd.DataFrame) -> None:
         self.tables[name] = df.copy()
         self.graphs[name] = build_semantic_graph(
-            df,
-            name,
-            self.encoder,
-            self.kg,
+            df=df,
+            table_name=name,
+            text_encoder=self.text_encoder,
+            kglink_encoder=self.kglink_encoder,
             max_hyperedge_size=self.max_hyperedge_size,
         )
 
     def search(self, query_df: pd.DataFrame, k: int = 5) -> List[Tuple[str, float]]:
         q_graph = build_semantic_graph(
-            query_df,
-            "query",
-            self.encoder,
-            self.kg,
+            df=query_df,
+            table_name="query",
+            text_encoder=self.text_encoder,
+            kglink_encoder=self.kglink_encoder,
             max_hyperedge_size=self.max_hyperedge_size,
         )
 
@@ -770,8 +786,8 @@ class SantosHyperKGLink:
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores[:k]
 
-    def explain_column(self, df: pd.DataFrame, col: str) -> Dict:
-        info = build_column_info(df, col, self.encoder, self.kg)
+    def explain_column(self, df: pd.DataFrame, col: str) -> Dict[str, Any]:
+        info = self.kglink_encoder.encode_column(df, col)
         return {
             "column": col,
             "candidate_types": info.candidate_types,
@@ -779,12 +795,12 @@ class SantosHyperKGLink:
             "coverage": info.coverage,
         }
 
-    def explain_hyperedges(self, df: pd.DataFrame) -> List[Dict]:
+    def explain_hyperedges(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
         g = build_semantic_graph(
-            df,
-            "tmp",
-            self.encoder,
-            self.kg,
+            df=df,
+            table_name="tmp",
+            text_encoder=self.text_encoder,
+            kglink_encoder=self.kglink_encoder,
             max_hyperedge_size=self.max_hyperedge_size,
         )
         out = []
@@ -807,30 +823,22 @@ class SantosHyperKGLink:
 if __name__ == "__main__":
     santos = SantosHyperKGLink(max_hyperedge_size=3)
 
-    parks = pd.DataFrame({
-        "Park Name": ["River Park", "West Lawn Park", "Lawler Park"],
-        "City": ["Fresno", "Chicago", "Riverside"],
-        "Country": ["USA", "USA", "USA"],
-        "Supervisor": ["Vera Onate", "Paul Veliotis", "Anna Reed"],
-    })
-
-    films = pd.DataFrame({
-        "Film Title": ["Bee Movie", "Coco", "Moana"],
-        "Film Director": ["Simon J. Smith", "Adrian Molina", "Ron Clements"],
-        "Year": [2007, 2017, 2016],
-    })
-
-    people = pd.DataFrame({
-        "Person": ["James Taylor", "Anthony Pelissier", "Akram Afif"],
-        "Birthplace": ["Boston", "Barnet", "Doha"],
-        "Country": ["USA", "UK", "Qatar"],
-        "Occupation": ["Singer", "Film Director", "Football Player"],
-    })
-
     sports = pd.DataFrame({
         "Player": ["Messi", "Messi", "Akram Afif"],
         "Team": ["PSG", "PSG", "PSG"],
         "Year": [2022, 2023, 2022],
+    })
+
+    sports2 = pd.DataFrame({
+        "Athlete": ["Messi", "Akram Afif"],
+        "Club": ["PSG", "PSG"],
+        "Season": [2022, 2022],
+    })
+
+    films = pd.DataFrame({
+        "Film Title": ["Coco", "Moana"],
+        "Film Director": ["Adrian Molina", "Ron Clements"],
+        "Year": [2017, 2016],
     })
 
     cities = pd.DataFrame({
@@ -839,10 +847,9 @@ if __name__ == "__main__":
         "Population": [2700000, 540000, 956000],
     })
 
-    santos.add_table("parks", parks)
-    santos.add_table("films", films)
-    santos.add_table("people", people)
     santos.add_table("sports", sports)
+    santos.add_table("sports2", sports2)
+    santos.add_table("films", films)
     santos.add_table("cities", cities)
 
     query = pd.DataFrame({
@@ -855,7 +862,10 @@ if __name__ == "__main__":
     for h in santos.explain_hyperedges(query):
         print(h)
 
+    print("\n=== Explain columns ===")
+    for c in query.columns:
+        print(santos.explain_column(query, c))
+
     print("\n=== Top unionable tables ===")
-    results = santos.search(query, k=5)
-    for name, score in results:
+    for name, score in santos.search(query, k=5):
         print(f"{name:10s} -> {score:.4f}")

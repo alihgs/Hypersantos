@@ -1,0 +1,9 @@
+{"entity_id":"Q1","label":"Chicago","aliases":["city of chicago"],"types":["city","location"],"neighbors":["USA","Illinois"]}
+{"entity_id":"Q2","label":"Fresno","aliases":["fresno california"],"types":["city","location"],"neighbors":["USA","California"]}
+{"entity_id":"Q3","label":"Doha","aliases":["capital of qatar"],"types":["city","location"],"neighbors":["Qatar"]}
+{"entity_id":"Q4","label":"USA","aliases":["united states"],"types":["country"],"neighbors":["North America"]}
+{"entity_id":"Q5","label":"Qatar","aliases":["state of qatar"],"types":["country"],"neighbors":["Asia"]}
+{"entity_id":"Q6","label":"Lionel Messi","aliases":["messi"],"types":["athlete","person"],"neighbors":["PSG"]}
+{"entity_id":"Q7","label":"PSG","aliases":["Paris Saint-Germain"],"types":["sports team"],"neighbors":["France"]}
+{"entity_id":"Q8","label":"Coco","aliases":["pixar coco"],"types":["film"],"neighbors":["Pixar"]}
+{"entity_id":"Q9","label":"Moana","aliases":["disney moana"],"types":["film"],"neighbors":["Disney"]}
