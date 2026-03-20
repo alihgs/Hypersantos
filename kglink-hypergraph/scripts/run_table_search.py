@@ -63,7 +63,6 @@ for file in os.listdir(TABLE_FOLDER):
 print("=== Top unionable tables ===")
 for table, vals in sorted(scores.items(), key=lambda x: x[1]["final_score"], reverse=True):
     print(
-        f"{table} -> final={vals['final_score']:.4f} | "
-        f"hyper={vals['hyper_score']:.4f} | "
-        f"kglink={vals['kglink_score']:.4f}"
+        f"{table} -> score_final={vals['final_score']:.4f} | "
+        
     )
